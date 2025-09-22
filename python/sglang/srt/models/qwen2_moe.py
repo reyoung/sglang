@@ -278,6 +278,7 @@ class Qwen2MoeAttention(nn.Module):
         qk_norm: bool = False,
         k_norm: bool = False,
         qk_rope_head_dim: int = 0,
+        qk_norm_eps: float = 1e-5,  
         quant_config: Optional[QuantizationConfig] = None,
         dual_chunk_attention_config: Optional[dict[str, Any]] = None,
         prefix: str = "",
@@ -311,9 +312,9 @@ class Qwen2MoeAttention(nn.Module):
         self.qk_norm = qk_norm
         self.only_k_norm = k_norm
 
-        self.q_norm = RMSNorm(self.head_dim) if self.qk_norm else nn.Identity()
+        self.q_norm = RMSNorm(self.head_dim, eps=qk_norm_eps) if self.qk_norm else nn.Identity()
         self.k_norm = RMSNorm(
-            self.head_dim
+            self.head_dim, eps=qk_norm_eps
         ) if self.qk_norm or self.only_k_norm else nn.Identity()
 
         self.qkv_proj = QKVParallelLinear(
@@ -446,6 +447,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         head_dim = getattr(config, "head_dim",
                            self.hidden_size // config.num_attention_heads)
         qk_rope_head_dim = getattr(config, "qk_rope_head_dim", head_dim)
+        qk_norm_eps = getattr(config, "qk_norm_eps", 1e-5)
         self.self_attn = Qwen2MoeAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -458,6 +460,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             qk_norm=qk_norm,
             k_norm=k_norm,
             qk_rope_head_dim=qk_rope_head_dim,
+            qk_norm_eps=qk_norm_eps,
             quant_config=quant_config,
             dual_chunk_attention_config=dual_chunk_attention_config,
             qkv_bias=qkv_bias,
