@@ -20,15 +20,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
-from sglang.srt.model_executor.model_runner import FlattenedTensorBucket
-from sglang.srt.patch_torch import monkey_patch_torch_reductions
-from sglang.srt.utils import MultiprocessingSerializer
-
-if TYPE_CHECKING:
-    from sglang.srt.model_executor.model_runner import (
-        FlattenedTensorBucketDict,
-        LocalSerializedTensor,
-    )
 
 logger = logging.getLogger(__name__)
 
@@ -115,21 +106,12 @@ class SchedulerUpdateWeightsMixin:
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors."""
-        monkey_patch_torch_reductions()
-        named_tensors = MultiprocessingSerializer.deserialize(
-            recv_req.serialized_named_tensors[self.tp_rank]
-        )
-        tp_worker_named_tensors, draft_worker_named_tensors = (
-            self._split_worker_and_draft_weight(named_tensors)
-        )
-        success, message = self.tp_worker.update_weights_from_tensor(
-            recv_req, named_tensors=tp_worker_named_tensors
-        )
+        success, message = self.tp_worker.update_weights_from_tensor(recv_req)
         if self.draft_worker is not None and hasattr(
             self.draft_worker, "update_weights_from_tensor"
         ):
             draft_success, draft_message = self.draft_worker.update_weights_from_tensor(
-                recv_req, named_tensors=draft_worker_named_tensors
+                recv_req
             )
             success = success and draft_success
             message = f"Main model: {message}. Draft model: {draft_message}."

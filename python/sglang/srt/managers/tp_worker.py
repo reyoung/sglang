@@ -48,10 +48,7 @@ from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_ran
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
-    from sglang.srt.model_executor.model_runner import (
-        FlattenedTensorBucketDict,
-        LocalSerializedTensor,
-    )
+    from sglang.srt.model_executor.model_runner import LocalSerializedTensor
 
 logger = logging.getLogger(__name__)
 
@@ -307,29 +304,11 @@ class TpModelWorker:
     def update_weights_from_tensor(
         self,
         recv_req: UpdateWeightsFromTensorReqInput,
-        named_tensors: Optional[
-            Union[
-                List[Tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
-                "FlattenedTensorBucketDict",
-            ]
-        ] = None,
     ):
-        """Update model weights from tensor
-
-        Args:
-            recv_req (UpdateWeightsFromTensorReqInput): Update weights request, including necessary information.
-            named_tensors (List[Tuple[str, Union[torch.Tensor, LocalSerializedTensor]]] | FlattenedTensorBucketDict, optional): Named tensors to update weights.
-                It's the deserialized from the request. Useful if deserialization is already done. Defaults to None.
-
-        Returns:
-            Tuple[bool, str]: (success, message)
-        """
-
         monkey_patch_torch_reductions()
-        if named_tensors is None:
-            named_tensors = MultiprocessingSerializer.deserialize(
-                recv_req.serialized_named_tensors[self.tp_rank]
-            )
+        named_tensors = MultiprocessingSerializer.deserialize(
+            recv_req.serialized_named_tensors[self.tp_rank]
+        )
         success, message = self.model_runner.update_weights_from_tensor(
             named_tensors=named_tensors,
             load_format=recv_req.load_format,
