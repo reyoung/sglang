@@ -20,6 +20,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.utils import MultiprocessingSerializer
 
 logger = logging.getLogger(__name__)
 
@@ -55,63 +57,20 @@ class SchedulerUpdateWeightsMixin:
             logger.error(message)
         return UpdateWeightsFromDistributedReqOutput(success, message)
 
-    def _split_worker_and_draft_weight(
-        self,
-        named_tensors: Union[
-            "FlattenedTensorBucketDict",
-            List[Tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
-        ],
-    ):
-        if isinstance(named_tensors, list):
-            # List of tuples: (name, tensor)
-            tp_worker_named_tensors = [
-                (name, tensor)
-                for name, tensor in named_tensors
-                if name in self.tp_worker_param_names
-            ]
-            if self.draft_worker is not None:
-                draft_worker_named_tensors = [
-                    (name, tensor)
-                    for name, tensor in named_tensors
-                    if name not in self.tp_worker_param_names
-                ]
-            else:
-                draft_worker_named_tensors = None
-            return tp_worker_named_tensors, draft_worker_named_tensors
-        elif isinstance(named_tensors, dict):
-            flattend_tensor = named_tensors["flattened_tensor"]
-            total_meta = named_tensors["metadata"]
-            tp_meta = [
-                meta for meta in total_meta if meta.name in self.tp_worker_param_names
-            ]
-            tp_worker_named_tensors = {
-                "flattened_tensor": flattend_tensor,
-                "metadata": tp_meta,
-            }
-            if self.draft_worker is not None:
-                draft_meta = [
-                    meta
-                    for meta in total_meta
-                    if meta.name not in self.tp_worker_param_names
-                ]
-                draft_worker_named_tensors = {
-                    "flattened_tensor": flattend_tensor,
-                    "metadata": draft_meta,
-                }
-            else:
-                draft_worker_named_tensors = None
-            return tp_worker_named_tensors, draft_worker_named_tensors
-        else:
-            raise ValueError(f"Invalid type for named_tensors: {type(named_tensors)}")
-
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors."""
-        success, message = self.tp_worker.update_weights_from_tensor(recv_req)
+        monkey_patch_torch_reductions()
+        named_tensors = MultiprocessingSerializer.deserialize(
+            recv_req.serialized_named_tensors[self.tp_rank]
+        )
+        success, message = self.tp_worker.update_weights_from_tensor(
+            recv_req, named_tensors
+        )
         if self.draft_worker is not None and hasattr(
             self.draft_worker, "update_weights_from_tensor"
         ):
             draft_success, draft_message = self.draft_worker.update_weights_from_tensor(
-                recv_req
+                recv_req, named_tensors
             )
             success = success and draft_success
             message = f"Main model: {message}. Draft model: {draft_message}."
