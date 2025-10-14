@@ -48,7 +48,10 @@ from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_ran
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
-    from sglang.srt.model_executor.model_runner import LocalSerializedTensor
+    from sglang.srt.model_executor.model_runner import (
+        FlattenedTensorBucketDict,
+        LocalSerializedTensor,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -304,7 +307,12 @@ class TpModelWorker:
     def update_weights_from_tensor(
         self,
         recv_req: UpdateWeightsFromTensorReqInput,
-        named_tensors,
+        named_tensors: Optional[
+            Union[
+                List[Tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
+                "FlattenedTensorBucketDict",
+            ]
+        ] = None,
     ):
         monkey_patch_torch_reductions()
         if named_tensors is None:
