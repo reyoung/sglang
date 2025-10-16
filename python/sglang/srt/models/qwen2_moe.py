@@ -55,7 +55,14 @@ from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding import (
+    LinearScalingRotaryEmbedding,
+    RotaryEmbedding,
+    _apply_rotary_emb,
+    _yarn_find_correction_range,
+    _yarn_linear_ramp_mask,
+    yarn_get_mscale,
+)
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -115,13 +122,14 @@ class Qwen2MoeMLP(nn.Module):
         )
         return x
 
+
 def expert_bias_routing(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
     topk: int,
     expert_bias: torch.Tensor,
     renormalize: bool = False,
-    score_func: str = 'sigmoid',
+    score_func: str = "sigmoid",
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
     if score_func == "softmax":
@@ -151,6 +159,7 @@ def sigmoid_routing_function(
     topk_scores = torch.gather(scores, dim=1, index=indices).type_as(scores)
     return topk_scores, indices
 
+
 class Qwen2MoeSparseMoeBlock(nn.Module):
 
     def __init__(
@@ -162,22 +171,27 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.expert_bias = torch.nn.Parameter(torch.zeros(
-            (config.num_experts)))
+        self.expert_bias = torch.nn.Parameter(torch.zeros((config.num_experts)))
         self.layer_id = layer_id
         if self.tp_size > config.num_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
-                f"the number of experts {config.num_experts}.")
+                f"the number of experts {config.num_experts}."
+            )
 
-        self.router_score_func = (config.router_score_func if hasattr(
-            config, "router_score_func") else "softmax")
+        self.router_score_func = (
+            config.router_score_func
+            if hasattr(config, "router_score_func")
+            else "softmax"
+        )
         if config.moe_routing_type == "expert_bias":
             from functools import partial
+
             custom_routing_function = partial(
                 expert_bias_routing,
                 expert_bias=self.expert_bias,
-                score_func=self.router_score_func)
+                score_func=self.router_score_func,
+            )
             self.custom_routing_function = custom_routing_function
         else:
             if self.router_score_func == "softmax":
@@ -185,8 +199,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             elif self.router_score_func == "sigmoid":
                 self.custom_routing_function = sigmoid_routing_function
             else:
-                raise ValueError(
-                    f"Unknown router_score_func: {self.router_score_func}")
+                raise ValueError(f"Unknown router_score_func: {self.router_score_func}")
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
@@ -225,12 +238,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         self.shared_expert_gate = None
         has_shared_expert_gate = getattr(
-            config, "has_shared_expert_gate",
-            True)  # default to true since qwen2_moe always has it
+            config, "has_shared_expert_gate", True
+        )  # default to true since qwen2_moe always has it
         if has_shared_expert_gate:
-            self.shared_expert_gate = torch.nn.Linear(config.hidden_size,
-                                                      1,
-                                                      bias=False)
+            self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
     def forward(
         self,
@@ -245,8 +256,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             shared_output = self.shared_expert(hidden_states)
             if self.shared_expert_gate is not None:
                 shared_output = (
-                    F.sigmoid(self.shared_expert_gate(hidden_states)) *
-                    shared_output)
+                    F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_output
+                )
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
@@ -255,10 +266,187 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
         if self.tp_size > 1 and not use_reduce_scatter:
-            final_hidden_states = tensor_model_parallel_all_reduce(
-                final_hidden_states)
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
+
+
+class Qwen2MoeYarnScalingRotaryEmbedding(RotaryEmbedding):
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: int,
+        is_neox_style: bool,
+        scaling_factor: float,
+        dtype: torch.dtype,
+        *,
+        extrapolation_factor: float = 1,
+        attn_factor: float = 1,
+        beta_fast: int = 32,
+        beta_slow: int = 1,
+        mscale: float = 1,
+        mscale_all_dim: float = 0,
+        compress: float = 0,
+        max_position: int = 40 * 4096,
+    ) -> None:
+        self.scaling_factor = scaling_factor
+        self.extrapolation_factor = extrapolation_factor
+        self.attn_factor = attn_factor
+        self.beta_fast = beta_fast
+        self.beta_slow = beta_slow
+        self.compress = compress
+        super().__init__(
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
+        )
+
+        self.mscale = mscale
+        self.mscale_all_dim = mscale_all_dim
+        self.max_position = max_position
+        inv_freq_extra = 1.0 / (
+            self.base
+            ** (
+                torch.arange(0, self.rotary_dim, 2, dtype=torch.float32)
+                / self.rotary_dim
+            )
+        )
+        inv_freq_inter = 1.0 / (
+            self.scaling_factor
+            * self.base
+            ** (
+                torch.arange(0, self.rotary_dim, 2, dtype=torch.float32)
+                / self.rotary_dim
+            )
+        )
+        self.register_buffer("inv_freq_extra", inv_freq_extra, persistent=False)
+        self.register_buffer("inv_freq_inter", inv_freq_inter, persistent=False)
+
+        self.cos_sin_cache = self._update_cos_sin_cache(self.max_position)
+
+    def _update_cos_sin_cache(self, seqlen: int):
+        """Update cos/sin cache with YaRN scaling"""
+        low, high = _yarn_find_correction_range(
+            self.beta_fast,
+            self.beta_slow,
+            self.rotary_dim,
+            self.base,
+            self.max_position_embeddings,
+        )
+        inv_freq_mask = 1.0 - _yarn_linear_ramp_mask(
+            low, high, self.rotary_dim // 2, dtype=torch.float32
+        ).to(device=self.inv_freq_inter.device)
+
+        inv_freq = (
+            self.inv_freq_inter * (1 - inv_freq_mask)
+            + self.inv_freq_extra * inv_freq_mask
+        )
+
+        seq = (
+            torch.arange(seqlen, device=self.inv_freq_extra.device, dtype=torch.float32)
+            * self.compress
+        )
+
+        freqs = torch.outer(seq, inv_freq)
+
+        _mscale = float(
+            yarn_get_mscale(self.scaling_factor, self.mscale)
+            / yarn_get_mscale(self.scaling_factor, self.mscale_all_dim)
+        )
+
+        _cos_cached = (torch.cos(freqs) * _mscale).to(torch.float32)
+        _sin_cached = (torch.sin(freqs) * _mscale).to(torch.float32)
+        cache = torch.cat((_cos_cached, _sin_cached), dim=-1)
+        return cache
+
+
+_ROPE_DICT: Dict[Tuple, RotaryEmbedding] = {}
+
+
+def get_rope(
+    head_size: int,
+    rotary_dim: int,
+    max_position: int,
+    base: int,
+    is_neox_style: bool = True,
+    compress: float = 1.0,
+    rope_scaling: Optional[Dict[str, Any]] = None,
+    dtype: Optional[torch.dtype] = None,
+    partial_rotary_factor: float = 1.0,
+) -> RotaryEmbedding:
+    if dtype is None:
+        dtype = torch.get_default_dtype()
+    if rope_scaling is not None:
+        # Transforms every value that is a list into a tuple for caching calls
+        rope_scaling_tuple = {
+            k: tuple(v) if isinstance(v, list) else v for k, v in rope_scaling.items()
+        }
+        rope_scaling_args = tuple(rope_scaling_tuple.items())
+    else:
+        rope_scaling_args = None
+    if partial_rotary_factor < 1.0:
+        rotary_dim = int(rotary_dim * partial_rotary_factor)
+    key = (
+        head_size,
+        rotary_dim,
+        max_position,
+        base,
+        is_neox_style,
+        rope_scaling_args,
+        dtype,
+    )
+    if key in _ROPE_DICT:
+        return _ROPE_DICT[key]
+
+    if rope_scaling is None:
+        raise ValueError(f"Please set RoPE scaling")
+    else:
+        scaling_type = rope_scaling["type"]
+
+        if scaling_type == "linear":
+            scaling_factor = rope_scaling["factor"]
+            rotary_emb = LinearScalingRotaryEmbedding(
+                head_size,
+                rotary_dim,
+                max_position,
+                base,
+                is_neox_style,
+                scaling_factor,
+                dtype,
+            )
+
+        elif scaling_type == "yarn":
+            scaling_factor = rope_scaling["factor"]
+            original_max_position = rope_scaling["original_max_position_embeddings"]
+            extra_kwargs = {
+                k: v
+                for k, v in rope_scaling.items()
+                if k
+                in (
+                    "extrapolation_factor",
+                    "attn_factor",
+                    "beta_fast",
+                    "beta_slow",
+                    "mscale",
+                    "mscale_all_dim",
+                )
+            }
+            rotary_emb = Qwen2MoeYarnScalingRotaryEmbedding(
+                head_size,
+                rotary_dim,
+                original_max_position,
+                base,
+                is_neox_style,
+                scaling_factor,
+                dtype,
+                **extra_kwargs,
+                compress=compress,
+                max_position=max_position,
+            )
+        else:
+            raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+    _ROPE_DICT[key] = rotary_emb
+    return rotary_emb
 
 
 class Qwen2MoeAttention(nn.Module):
@@ -272,13 +460,14 @@ class Qwen2MoeAttention(nn.Module):
         layer_id: int = 0,
         rope_theta: float = 10000,
         rope_scaling: Optional[Dict[str, Any]] = None,
+        compress: float = 1.0,
         max_position_embeddings: int = 8192,
         qkv_bias: int = True,
         out_bias: int = False,
         qk_norm: bool = False,
         k_norm: bool = False,
         qk_rope_head_dim: int = 0,
-        qk_norm_eps: float = 1e-5,  
+        qk_norm_eps: float = 1e-5,
         quant_config: Optional[QuantizationConfig] = None,
         dual_chunk_attention_config: Optional[dict[str, Any]] = None,
         prefix: str = "",
@@ -307,15 +496,20 @@ class Qwen2MoeAttention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
+        self.compress = compress
         self.max_position_embeddings = max_position_embeddings
         self.qk_rope_head_dim = qk_rope_head_dim
         self.qk_norm = qk_norm
         self.only_k_norm = k_norm
 
-        self.q_norm = RMSNorm(self.head_dim, eps=qk_norm_eps) if self.qk_norm else nn.Identity()
-        self.k_norm = RMSNorm(
-            self.head_dim, eps=qk_norm_eps
-        ) if self.qk_norm or self.only_k_norm else nn.Identity()
+        self.q_norm = (
+            RMSNorm(self.head_dim, eps=qk_norm_eps) if self.qk_norm else nn.Identity()
+        )
+        self.k_norm = (
+            RMSNorm(self.head_dim, eps=qk_norm_eps)
+            if self.qk_norm or self.only_k_norm
+            else nn.Identity()
+        )
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -340,13 +534,18 @@ class Qwen2MoeAttention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
+        if rope_scaling is None:
+            rope_scaling = {"type": "linear", "factor": 1 / self.compress}
+        else:
+            assert self.compress == 1.0, "Compress must be 1.0 for custom rope scaling."
+
         self.rotary_emb = get_rope(
             self.qk_rope_head_dim,
             rotary_dim=self.qk_rope_head_dim,
             max_position=max_position_embeddings,
             base=rope_theta,
+            compress=self.compress,
             rope_scaling=rope_scaling,
-            dual_chunk_attention_config=dual_chunk_attention_config,
         )
         self.attn = RadixAttention(
             self.num_heads,
@@ -369,14 +568,12 @@ class Qwen2MoeAttention(nn.Module):
         q_shape = q.shape
         k_shape = k.shape
 
-        q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim,
-                           self.head_dim)
+        q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
         if self.qk_norm:
             q_by_head = self.q_norm.forward_native(q_by_head)
         q = q_by_head.view(q.shape)
 
-        k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim,
-                           self.head_dim)
+        k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
         if self.qk_norm or self.only_k_norm:
             k_by_head = self.k_norm.forward_native(k_by_head)
         k = k_by_head.view(k.shape)
@@ -384,22 +581,26 @@ class Qwen2MoeAttention(nn.Module):
         qk_nope_head_dim = self.head_dim - self.qk_rope_head_dim
         if qk_nope_head_dim > 0:
             q_nope, q_pe = q.view(q_by_head.shape).split(
-                [qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+                [qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+            )
             k_nope, k_pe = k.view(k_by_head.shape).split(
-                [qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+                [qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+            )
 
             q_pe = q_pe.reshape(
-                (*q_shape[:-1],
-                 q_shape[-1] // self.head_dim * self.qk_rope_head_dim))
+                (*q_shape[:-1], q_shape[-1] // self.head_dim * self.qk_rope_head_dim)
+            )
             k_pe = k_pe.reshape(
-                (*k_shape[:-1],
-                 k_shape[-1] // self.head_dim * self.qk_rope_head_dim))
+                (*k_shape[:-1], k_shape[-1] // self.head_dim * self.qk_rope_head_dim)
+            )
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
             q_pe = q_pe.reshape(
-                (*q_shape[:-1], q_shape[-1] // self.head_dim, -1)).clone()
+                (*q_shape[:-1], q_shape[-1] // self.head_dim, -1)
+            ).clone()
             k_pe = k_pe.reshape(
-                (*k_shape[:-1], k_shape[-1] // self.head_dim, -1)).clone()
+                (*k_shape[:-1], k_shape[-1] // self.head_dim, -1)
+            ).clone()
 
             q = q.reshape(q_by_head.shape)
             k = k.reshape(k_by_head.shape)
@@ -444,8 +645,9 @@ class Qwen2MoeDecoderLayer(nn.Module):
         qk_norm = getattr(config, "qk_norm", False)
         k_norm = getattr(config, "k_norm", False)
         out_bias = getattr(config, "out_proj_bias", False)
-        head_dim = getattr(config, "head_dim",
-                           self.hidden_size // config.num_attention_heads)
+        head_dim = getattr(
+            config, "head_dim", self.hidden_size // config.num_attention_heads
+        )
         qk_rope_head_dim = getattr(config, "qk_rope_head_dim", head_dim)
         self.self_attn = Qwen2MoeAttention(
             hidden_size=self.hidden_size,
@@ -455,6 +657,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
             layer_id=layer_id,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
+            compress=config.rotary_compress,
             max_position_embeddings=max_position_embeddings,
             qk_norm=qk_norm,
             k_norm=k_norm,
@@ -670,9 +873,9 @@ class Qwen2MoeForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
-        self.model = Qwen2MoeModel(config,
-                                   quant_config,
-                                   prefix=add_prefix("model", prefix))
+        self.model = Qwen2MoeModel(
+            config, quant_config, prefix=add_prefix("model", prefix)
+        )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
@@ -715,9 +918,9 @@ class Qwen2MoeForCausalLM(nn.Module):
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
         if self.pp_group.is_last_rank:
-            return self.logits_processor(input_ids, hidden_states,
-                                         self.lm_head, forward_batch,
-                                         aux_hidden_states)
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+            )
         else:
             return hidden_states
 
@@ -734,15 +937,13 @@ class Qwen2MoeForCausalLM(nn.Module):
         # embed
         if start == 0:
             if input_embeds is None:
-                forward_batch.hidden_states = self.model.embed_tokens(
-                    input_ids)
+                forward_batch.hidden_states = self.model.embed_tokens(input_ids)
             else:
                 forward_batch.hidden_states = input_embeds
 
         # decoder layer
         for i in range(start, end):
-            with get_global_expert_distribution_recorder().with_current_layer(
-                    i):
+            with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.model.layers[i]
                 forward_batch.hidden_states, forward_batch.residual = layer(
                     positions,
@@ -753,13 +954,14 @@ class Qwen2MoeForCausalLM(nn.Module):
 
         if end == self.model.config.num_hidden_layers:
             # norm
-            hidden_states, _ = self.model.norm(forward_batch.hidden_states,
-                                               forward_batch.residual)
+            hidden_states, _ = self.model.norm(
+                forward_batch.hidden_states, forward_batch.residual
+            )
             forward_batch.hidden_states = hidden_states
             # logits process
-            result = self.logits_processor(input_ids,
-                                           forward_batch.hidden_states,
-                                           self.lm_head, forward_batch)
+            result = self.logits_processor(
+                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
+            )
         else:
             result = None
 
@@ -773,19 +975,19 @@ class Qwen2MoeForCausalLM(nn.Module):
     def end_layer(self):
         return self.model.end_layer
 
-    def load_weights(self,
-                     weights: Iterable[Tuple[str, torch.Tensor]],
-                     is_nextn=False):
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
                 assert num_nextn_layers == 1, "Only 1 nextn layer is supported"
                 # compatible with old design
-                nextn_layer_id = (0 if self.config.num_hidden_layers == 1 else
-                                  self.config.num_hidden_layers)
+                nextn_layer_id = (
+                    0
+                    if self.config.num_hidden_layers == 1
+                    else self.config.num_hidden_layers
+                )
             else:
-                raise ValueError(
-                    "num_nextn_predict_layers is not in the config")
+                raise ValueError("num_nextn_predict_layers is not in the config")
 
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -816,11 +1018,12 @@ class Qwen2MoeForCausalLM(nn.Module):
             if not is_nextn:
                 if hasattr(self.config, "num_nextn_predict_layers"):
                     num_nextn_layers = self.config.num_nextn_predict_layers
-                    if num_nextn_layers > 0 and name.startswith(
-                            "model.layers"):
+                    if num_nextn_layers > 0 and name.startswith("model.layers"):
                         name_list = name.split(".")
-                        if (len(name_list) >= 3 and int(name_list[2])
-                                >= self.config.num_hidden_layers):
+                        if (
+                            len(name_list) >= 3
+                            and int(name_list[2]) >= self.config.num_hidden_layers
+                        ):
                             continue
             else:
                 if not name.startswith(nextn_layer_prefix):
@@ -842,9 +1045,14 @@ class Qwen2MoeForCausalLM(nn.Module):
                     name = name.replace(nextn_layer_prefix, "model.decoder")
 
             layer_id = get_layer_id(name)
-            if (layer_id is not None and hasattr(self.model, "start_layer")
-                    and (layer_id < self.model.start_layer
-                         or layer_id >= self.model.end_layer)):
+            if (
+                layer_id is not None
+                and hasattr(self.model, "start_layer")
+                and (
+                    layer_id < self.model.start_layer
+                    or layer_id >= self.model.end_layer
+                )
+            ):
                 continue
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -896,12 +1104,12 @@ class Qwen2MoeForCausalLM(nn.Module):
 
                     if name in params_dict.keys():
                         param = params_dict[name]
-                        weight_loader = getattr(param, "weight_loader",
-                                                default_weight_loader)
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
                         weight_loader(param, loaded_weight)
                     else:
-                        logger.warning(
-                            f"Parameter {name} not found in params_dict")
+                        logger.warning(f"Parameter {name} not found in params_dict")
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
@@ -911,8 +1119,7 @@ class Qwen2MoeForCausalLM(nn.Module):
             num_groups=None,
         )
 
-    def set_eagle3_layers_to_capture(self,
-                                     layer_ids: Optional[List[int]] = None):
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
         if not self.pp_group.is_last_rank:
             return
 
