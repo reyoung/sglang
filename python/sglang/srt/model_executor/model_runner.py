@@ -21,9 +21,9 @@ import logging
 import os
 import time
 from collections import defaultdict
-from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
 from contextlib import nullcontext
+from dataclasses import dataclass
+from typing import List, Optional, Tuple, TypedDict, Union
 
 import torch
 import torch.distributed as dist
@@ -133,6 +133,14 @@ from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
     FlattenedTensorMetadata,
 )
+
+
+class FlattenedTensorBucketDict(TypedDict):
+    """Type hint for flattened tensor bucket dictionary for `update_weights_from_tensor` if `load_format=="flattened_bucket"`"""
+
+    metadata: List[FlattenedTensorMetadata]
+    flattened_tensor: torch.Tensor
+
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -710,7 +718,11 @@ class ModelRunner:
         monkey_patch_vllm_parallel_state()
         monkey_patch_isinstance_for_vllm_base_layer()
 
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_WEIGHTS) if not self.is_draft_worker else nullcontext():
+        with (
+            self.memory_saver_adapter.region(GPU_MEMORY_TYPE_WEIGHTS)
+            if not self.is_draft_worker
+            else nullcontext()
+        ):
             self.model = get_model(
                 model_config=self.model_config,
                 load_config=self.load_config,
@@ -941,7 +953,10 @@ class ModelRunner:
 
     def update_weights_from_tensor(
         self,
-        named_tensors: List[Tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
+        named_tensors: Union[
+            List[Tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
+            "FlattenedTensorBucketDict",
+        ],
         load_format: Optional[str] = None,
     ):
         monkey_patch_torch_reductions()
@@ -972,7 +987,7 @@ class ModelRunner:
 
     def _update_weights_from_flattened_bucket(
         self,
-        flattened_tensor_bucket_dict,
+        flattened_tensor_bucket_dict: FlattenedTensorBucketDict,
     ):
         """Handle flattened bucket format for weight updates"""
         flattened_tensor = flattened_tensor_bucket_dict["flattened_tensor"]

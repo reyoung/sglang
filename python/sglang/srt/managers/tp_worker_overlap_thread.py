@@ -19,7 +19,7 @@ import logging
 import signal
 import threading
 from queue import Queue
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import psutil
 import torch
@@ -41,6 +41,10 @@ from sglang.utils import get_exception_traceback
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
+    from sglang.srt.model_executor.model_runner import (
+        FlattenedTensorBucketDict,
+        LocalSerializedTensor,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -273,8 +277,19 @@ class TpModelWorkerClient:
         success, message = self.worker.update_weights_from_distributed(recv_req)
         return success, message
 
-    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
-        success, message = self.worker.update_weights_from_tensor(recv_req)
+    def update_weights_from_tensor(
+        self,
+        recv_req: UpdateWeightsFromTensorReqInput,
+        named_tensors: Optional[
+            Union[
+                List[Tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
+                "FlattenedTensorBucketDict",
+            ]
+        ] = None,
+    ):
+        success, message = self.worker.update_weights_from_tensor(
+            recv_req, named_tensors
+        )
         return success, message
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):

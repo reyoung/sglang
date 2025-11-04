@@ -336,6 +336,17 @@ class Scheduler(
             nccl_port=port_args.nccl_port,
         )
 
+        # Use worker param names to distinguish between normal weights and draft model weights.
+        if isinstance(self.tp_worker, TpModelWorker):
+            self.tp_worker_param_names = set(
+                name for name, _ in self.tp_worker.model_runner.model.named_parameters()
+            )
+        else:
+            self.tp_worker_param_names = set(
+                name
+                for name, _ in self.tp_worker.worker.model_runner.model.named_parameters()
+            )
+
         # Launch a draft worker for speculative decoding
         if self.spec_algorithm.is_eagle():
             from sglang.srt.speculative.eagle_worker import EAGLEWorker

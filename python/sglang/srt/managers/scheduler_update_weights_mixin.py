@@ -1,5 +1,5 @@
 import logging
-from typing import Tuple
+from typing import TYPE_CHECKING, List, Tuple, Union
 
 import torch
 
@@ -20,6 +20,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.utils import MultiprocessingSerializer
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +59,21 @@ class SchedulerUpdateWeightsMixin:
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors."""
-        success, message = self.tp_worker.update_weights_from_tensor(recv_req)
+        monkey_patch_torch_reductions()
+        named_tensors = MultiprocessingSerializer.deserialize(
+            recv_req.serialized_named_tensors[self.tp_rank]
+        )
+        success, message = self.tp_worker.update_weights_from_tensor(
+            recv_req, named_tensors
+        )
+        if self.draft_worker is not None and hasattr(
+            self.draft_worker, "update_weights_from_tensor"
+        ):
+            draft_success, draft_message = self.draft_worker.update_weights_from_tensor(
+                recv_req, named_tensors
+            )
+            success = success and draft_success
+            message = f"Main model: {message}. Draft model: {draft_message}."
         # TODO extract common code b/t update_weights_from_distributed and update_weights_from_tensor later
         if success:
             if recv_req.flush_cache:
