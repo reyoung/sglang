@@ -284,7 +284,7 @@ class TokenizerCommunicatorMixin:
         obj: InitWeightsUpdateGroupReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
-        # self.auto_create_handle_loop()
+        self.auto_create_handle_loop()
         # assert (
         #     self.server_args.dp_size == 1
         # ), "dp_size must be 1 for init parameter update group"
