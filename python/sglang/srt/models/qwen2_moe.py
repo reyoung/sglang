@@ -538,7 +538,14 @@ class Qwen2MoeAttention(nn.Module):
             rope_scaling = {"type": "linear", "factor": 1 / self.compress}
         else:
             assert self.compress == 1.0, "Compress must be 1.0 for custom rope scaling."
-
+            if rope_scaling["type"] == "yarn":
+                mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
+                apply_softmax_scale = rope_scaling.get("apply_softmax_scale", False)
+                scaling_factor = rope_scaling["factor"]
+                if apply_softmax_scale and mscale_all_dim:
+                    mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+                    self.scaling = self.scaling * mscale * mscale
+                    
         self.rotary_emb = get_rope(
             self.qk_rope_head_dim,
             rotary_dim=self.qk_rope_head_dim,
